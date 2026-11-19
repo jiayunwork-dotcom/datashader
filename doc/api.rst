@@ -147,6 +147,18 @@ Transfer Functions
    spread
    stack
 
+.. currentmodule:: datashader.transfer_functions
+
+**Colour calibration**
+
+.. autosummary::
+
+   calibrate
+   ColorCalibration
+   ColorCalibration.from_reference
+   ColorCalibration.forward
+   ColorCalibration.inverse
+
 Definitions
 -----------
 

@@ -39,10 +39,17 @@ class Pipeline:
         Factor by which to scale the provided height
     width_scale: float, optional
         Factor by which to scale the provided width
+    calibration : ColorCalibration, optional
+        An explicitly enabled calibrated colour scale, as returned by
+        :func:`datashader.transfer_functions.calibrate`. When given, the
+        default ``color_fn`` (``tf.shade``) is called with this calibration,
+        so the cells of the ``transform_fn`` output are coloured by the
+        fixed reference scale rather than by the current window. Custom
+        ``color_fn`` callables are not affected.
     """
     def __init__(self, df, glyph, agg=reductions.count(),
                  transform_fn=identity, color_fn=tf.shade, spread_fn=tf.dynspread,
-                 width_scale=1.0, height_scale=1.0):
+                 width_scale=1.0, height_scale=1.0, calibration=None):
         self.df = df
         self.glyph = glyph
         self.agg = agg
@@ -51,6 +58,7 @@ class Pipeline:
         self.spread_fn = spread_fn
         self.width_scale = width_scale
         self.height_scale = height_scale
+        self.calibration = calibration
 
     def __call__(self, x_range=None, y_range=None, width=600, height=600):
         """Compute an image from the specified pipeline.
@@ -68,5 +76,13 @@ class Pipeline:
                              x_range=x_range, y_range=y_range)
         bins = core.bypixel(self.df, canvas, self.glyph, self.agg,
                             antialias=self.glyph.antialiased)
-        img = self.color_fn(self.transform_fn(bins))
+        bins = self.transform_fn(bins)
+        if self.calibration is not None and self.color_fn is tf.shade:
+            # The default shading function is called with the fixed reference
+            # scale, so the cells of the transform_fn output are coloured
+            # independently of the current window.  An explicitly provided
+            # color_fn is used as-is.
+            img = self.color_fn(bins, calibration=self.calibration)
+        else:
+            img = self.color_fn(bins)
         return self.spread_fn(img)

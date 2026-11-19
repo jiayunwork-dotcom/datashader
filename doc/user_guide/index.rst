@@ -50,6 +50,10 @@ Contents:
 `13. GeoPandas <Geopandas.html>`_
  GeoPandas support in Datashader.
 
+`14. Colour Calibration <Colour_Calibration.html>`_
+ Keeping colours consistent across views by calibrating on a reference
+ aggregate.
+
 .. toctree::
     :hidden:
     :maxdepth: 3
@@ -67,3 +71,4 @@ Contents:
     Geography <Geography>
     Inspection Reductions <Inspection_Reductions>
     GeoPandas <Geopandas>
+    Colour Calibration <Colour_Calibration>

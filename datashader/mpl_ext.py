@@ -10,6 +10,7 @@ from . import reductions
 from . import transfer_functions as tf
 from .colors import Sets1to3
 from .core import bypixel, Canvas
+from .transfer_functions._calibration import ColorCalibration
 from .utils import uint32_to_uint8, uint8_to_uint32
 
 
@@ -265,8 +266,11 @@ class DSArtist(_ImageBase):
         x1, x2, y1, y2 = self.get_extent()
         bbox = Bbox(np.array([[x1, y1], [x2, y2]]))
 
-        # Fail-fast if visible extent does not overlap with data extent
-        if not bbox.overlaps(self.bbox_df):
+        # Fail-fast if visible extent does not overlap with data extent.
+        # In calibrated mode the aggregation is always recomputed, so that
+        # an empty window still updates the aggregate backing the artist
+        # (and the cursor query) and renders transparent.
+        if not bbox.overlaps(self.bbox_df) and getattr(self, "calibration", None) is None:
             return None, 0, 0, None
 
         trans = self.get_transform()
@@ -358,6 +362,7 @@ class ScalarDSArtist(DSArtist):
         norm=None,
         cmap=None,
         alpha=None,
+        calibration=None,
         **kwargs
     ):
         super().__init__(
@@ -375,6 +380,7 @@ class ScalarDSArtist(DSArtist):
             height_scale,
             **kwargs
         )
+        self.calibration = calibration
         self._vmin = norm.vmin
         self._vmax = norm.vmax
         self.set_norm(norm)
@@ -391,8 +397,22 @@ class ScalarDSArtist(DSArtist):
         self.set_array(np.eye(2))
 
     def shade(self, binned):
+        # Compute the mask according to Datashader's rules. Note that this
+        # must be done with the raw aggregate data, which is also what the
+        # cursor query reports.
+        mask = compute_mask(np.asarray(binned.data))
+
+        if self.calibration is not None:
+            # Calibrated mode: the scale is fixed by the calibration, so the
+            # values of the current window never influence the colours. The
+            # mask is applied here because the masked values are not
+            # necessarily NaN (e.g. they read 0 for unsigned aggregates).
+            data = binned.data
+            A = np.ma.masked_array(data.astype(np.float64, copy=False), mask)
+            self.set_array(A)
+            return self.to_rgba(A, bytes=True, norm=True)
+
         # Mask missing data in the greyscale array
-        mask = compute_mask(binned.data)
         A = np.ma.masked_array(binned.data, mask)
 
         # Rescale the norm to the current array
@@ -522,6 +542,7 @@ def dsshow(
     color_key=Sets1to3,
     alpha_range=(40, 255),
     color_baseline=None,
+    calibration=None,
     ax=None,
     fignum=None,
     aspect=None,
@@ -592,6 +613,16 @@ def dsshow(
         For categorical aggregates, the baseline for calculating how
         categorical data mixes to determine the color of a pixel. See
         `tf.shade` for more information.
+    calibration : ColorCalibration, optional
+        For scalar aggregates, an explicitly enabled calibrated colour scale
+        as returned by :func:`datashader.transfer_functions.calibrate`. When
+        given, colours (and the inverse lookups used for the colorbar and
+        cursor) always follow the fixed reference scale: panning, zooming or
+        moving into an empty window re-aggregates the data but never changes
+        the colour of a given aggregate value, and an empty window is
+        transparent. ``norm``, ``vmin`` and ``vmax`` are ignored in this
+        mode; ``cmap`` and ``alpha`` are honoured. Not supported for
+        categorical aggregations.
 
     Other Parameters
     ----------------
@@ -666,6 +697,10 @@ def dsshow(
         ax = fig.add_axes([0.15, 0.09, 0.775, 0.775])
 
     if isinstance(aggregator, reductions.by):
+        if calibration is not None:
+            raise ValueError(
+                "`calibration` is not supported for categorical aggregations"
+            )
         artist = CategoricalDSArtist(
             ax,
             df,
@@ -689,7 +724,16 @@ def dsshow(
             if isinstance(cmap, list):
                 cmap = mpl.colors.LinearSegmentedColormap.from_list("_datashader", cmap)
 
-        if norm is None:
+        if calibration is not None:
+            if not isinstance(calibration, ColorCalibration):
+                raise TypeError(
+                    "`calibration` must be a ColorCalibration, got "
+                    f"'{type(calibration).__name__}'"
+                )
+            # The calibrated scale fully defines the colour mapping, so
+            # `norm`, `vmin` and `vmax` are deliberately ignored.
+            norm = calibration.as_normalize()
+        elif norm is None:
             norm = mpl.colors.Normalize()
         elif isinstance(norm, str):
             if norm == "linear":
@@ -707,10 +751,16 @@ def dsshow(
                 "or a matplotlib norm instance."
             )
 
-        if vmin is not None:
-            norm.vmin = vmin
-        if vmax is not None:
-            norm.vmax = vmax
+        if calibration is None:
+            if vmin is not None:
+                norm.vmin = vmin
+            if vmax is not None:
+                norm.vmax = vmax
+        elif vmin is not None or vmax is not None:
+            warnings.warn(
+                "`vmin` and `vmax` are ignored when a `calibration` is given",
+                stacklevel=2,
+            )
 
         artist = ScalarDSArtist(
             ax,
@@ -728,6 +778,7 @@ def dsshow(
             norm=norm,
             cmap=cmap,
             alpha=alpha,
+            calibration=calibration,
             **kwargs
         )
 

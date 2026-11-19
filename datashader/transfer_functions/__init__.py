@@ -13,6 +13,7 @@ import xarray as xr
 
 from datashader.colors import rgb, Sets1to3
 from datashader.utils import nansum_missing, ngjit, uint32_to_uint8
+from ._calibration import ColorCalibration, calibrate
 
 try:
     import dask.array as da
@@ -24,7 +25,8 @@ try:
 except Exception:
     cupy = None
 
-__all__ = ['Image', 'stack', 'shade', 'set_background', 'spread', 'dynspread']
+__all__ = ['Image', 'stack', 'shade', 'set_background', 'spread', 'dynspread',
+           'ColorCalibration', 'calibrate']
 
 
 class Image(xr.DataArray):
@@ -357,6 +359,79 @@ def _interpolate(agg, cmap, how, alpha, span, min_alpha, name, rescale_discrete_
     return Image(img, coords=agg.coords, dims=agg.dims, name=name)
 
 
+def _interpolate_calibrated(agg, cmap, alpha, min_alpha, name, calibration):
+    """Colour a 2D aggregate using a fixed :class:`ColorCalibration`.
+
+    Unlike :func:`_interpolate`, the colour of a cell depends only on the
+    value of that cell and on the calibration, never on the minimum or
+    maximum of the aggregate being shaded.
+    """
+    if cupy and isinstance(agg.data, cupy.ndarray):
+        data = cupy.asnumpy(agg.data)
+    else:
+        data = agg.data
+    if da and isinstance(data, da.Array):
+        data = data.compute()
+
+    if agg.ndim != 2:
+        raise ValueError("agg must be 2D")
+
+    # Compute mask, using the same rules as _interpolate.
+    if np.issubdtype(data.dtype, np.bool_):
+        mask = ~data
+    elif data.dtype.kind == 'u':
+        mask = data == 0
+    else:
+        mask = np.isnan(data)
+
+    # Handle case where everything is masked out
+    if mask.all():
+        return Image(np.zeros(shape=agg.data.shape,
+                              dtype=np.uint32), coords=agg.coords,
+                     dims=agg.dims, attrs=agg.attrs, name=name)
+
+    # Positions in [0, 1] of the calibrated colour scale.  NaN and masked
+    # cells stay NaN, so they end up transparent below.
+    data = data.astype(np.float64, copy=False)
+    positions = calibration.forward(data)
+    positions[mask] = np.nan
+
+    interp = np.interp
+    if isinstance(cmap, Iterator):
+        cmap = list(cmap)
+    if isinstance(cmap, tuple) and isinstance(cmap[0], str):
+        cmap = list(cmap)  # Tuple of hex values or color names, as produced by Bokeh
+    if isinstance(cmap, list):
+        rspan, gspan, bspan = np.array(list(zip(*map(rgb, cmap))))
+        span = np.linspace(0, 1, len(cmap))
+        r = np.nan_to_num(interp(positions, span, rspan, left=255), copy=False).astype(np.uint8)
+        g = np.nan_to_num(interp(positions, span, gspan, left=255), copy=False).astype(np.uint8)
+        b = np.nan_to_num(interp(positions, span, bspan, left=255), copy=False).astype(np.uint8)
+        a = np.where(np.isnan(positions), 0, alpha).astype(np.uint8)
+        rgba = np.dstack([r, g, b, a])
+    elif isinstance(cmap, str) or isinstance(cmap, tuple):
+        color = rgb(cmap)
+        aspan = np.arange(min_alpha, alpha + 1)
+        span = np.linspace(0, 1, len(aspan))
+        r = np.full(positions.shape, color[0], dtype=np.uint8)
+        g = np.full(positions.shape, color[1], dtype=np.uint8)
+        b = np.full(positions.shape, color[2], dtype=np.uint8)
+        a = np.nan_to_num(interp(positions, span, aspan, left=0, right=255),
+                          copy=False).astype(np.uint8)
+        rgba = np.dstack([r, g, b, a])
+    elif callable(cmap):
+        # Assume callable is a matplotlib colormap
+        rgba = cmap(positions, bytes=True)
+        rgba[:, :, 3] = np.where(np.isnan(positions), 0, alpha).astype(np.uint8)
+    else:
+        raise TypeError("Expected `cmap` of `matplotlib.colors.Colormap`, "
+                        "`list`, `str`, or `tuple`; got: '{0}'".format(type(cmap)))
+
+    img = rgba.view(np.uint32).reshape(positions.shape)
+
+    return Image(img, coords=agg.coords, dims=agg.dims, name=name)
+
+
 def _colorize(agg, color_key, how, alpha, span, min_alpha, name, color_baseline,
               rescale_discrete_levels):
     if cupy and isinstance(agg.data, cupy.ndarray):
@@ -601,7 +676,7 @@ def _apply_discrete_colorkey(agg, color_key, alpha, name, color_baseline):
 
 def shade(agg, cmap=["lightblue", "darkblue"], color_key=Sets1to3,
           how='eq_hist', alpha=255, min_alpha=40, span=None, name=None,
-          color_baseline=None, rescale_discrete_levels=False):
+          color_baseline=None, rescale_discrete_levels=False, calibration=None):
     """Convert a DataArray to an image by choosing an RGBA pixel color for each value.
 
     Requires a DataArray with a single data dimension, here called the
@@ -705,6 +780,16 @@ def shade(agg, cmap=["lightblue", "darkblue"], color_key=Sets1to3,
         towards the (more visible) top of the ``cmap`` range, thus
         avoiding washout of the lower values.  Has no effect if
         ``how!=`eq_hist``. Default is False.
+    calibration : ColorCalibration, optional
+        An explicitly enabled calibrated colour scale, as returned by
+        :func:`calibrate`.  This is only supported for 2D aggregates without
+        a discrete ``color_key``.  When given, the colour of each cell is
+        looked up from the calibration using the cell's own aggregate value:
+        neither the minimum nor the maximum of ``agg`` (nor ``how`` and
+        ``span``) have any effect on the resulting colour, so colours are
+        comparable between different windows.  ``cmap``, ``alpha`` and
+        ``min_alpha`` are still honoured.  Default is ``None``, i.e. normal
+        Datashader autoscaling behaviour.
     """
     if not isinstance(agg, xr.DataArray):
         raise TypeError("agg must be instance of DataArray")
@@ -715,6 +800,20 @@ def shade(agg, cmap=["lightblue", "darkblue"], color_key=Sets1to3,
 
     if rescale_discrete_levels and how != 'eq_hist':
         rescale_discrete_levels = False
+
+    if calibration is not None:
+        if not isinstance(calibration, ColorCalibration):
+            raise TypeError(
+                "calibration must be a ColorCalibration, got: "
+                f"'{type(calibration).__name__}'"
+            )
+        if agg.ndim != 2:
+            raise ValueError("calibration is only supported for 2D aggregates")
+        if color_key is not None and isinstance(color_key, dict):
+            raise ValueError(
+                "calibration is not supported together with a discrete color_key"
+            )
+        return _interpolate_calibrated(agg, cmap, alpha, min_alpha, name, calibration)
 
     if agg.ndim == 2:
         if color_key is not None and isinstance(color_key, dict):
